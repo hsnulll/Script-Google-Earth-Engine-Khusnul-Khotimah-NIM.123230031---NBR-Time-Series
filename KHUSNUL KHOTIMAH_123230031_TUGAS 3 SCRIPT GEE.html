@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Script GEE NBR</title>
+  <style>
+    body {
+      font-family: monospace;
+      background-color: #f5f5f5;
+      padding: 20px;
+    }
+    pre {
+      background: #1e1e1e;
+      color: #dcdcdc;
+      padding: 15px;
+      border-radius: 8px;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+
+<body>
+
+<h2>Script Google Earth Engine (Khusnul Khotimah NIM.123230031)- NBR Time Series</h2>
+
+<pre><code>
+/* TIME-SERIES NBR /
+// Referensi: Alcaras, E., Costantino, D., Guastaferro, F., Parente, C., & Pepe, M. (2022). Normalized Burn Ratio Plus (NBR+): A New Index for Sentinel-2 Imagery. Remote Sensing, 14(7), 1727. https://doi.org/10.3390/rs14071727
+// Referensi: Rizqika, S. N., Prasetyo, Y., & Yusuf, M. A. (2022). ANALISIS AKURASI PERBANDINGAN ALGORITMA INDEKS KEBAKARAN HUTAN (NBR, BAIS2, MIRBI, dan NDVI) BERDASARKAN CITRA SENTINEL-2A (Studi Kasus :Taman Nasional Gunung Merbabu Provinsi Jawa Tengah). Elipsoida : Jurnal Geodesi dan Geomatika, 5(1), 1-8. https://doi.org/10.14710/elipsoida.2022.16858
+
+/*** 0) CONFIG ***/
+var START = '2025-02-01';
+var END   = '2026-02-28';
+var SCALE = 10;
+
+/*** 1) AOI ***/
+var riau = ee.FeatureCollection("FAO/GAUL/2015/level1")
+  .filter(ee.Filter.eq('ADM1_NAME','Riau'));
+
+Map.centerObject(riau,7);
+
+/*** 2) KELAS LAHAN ***/
+var burnPoly = ee.Geometry.Polygon([
+  [ 
+    [101.89399814351549,0.11572952223061624],
+    [102.39387607320299,0.11572952223061624],
+    [102.39387607320299,0.6101028366649174],
+    [101.89399814351549,0.6101028366649174],
+    [101.89399814351549,0.11572952223061624]
+  ]
+]);
+
+var vegPoly = ee.Geometry.Polygon([
+  [
+    [102.48873685466911, 0.3175050438379287],
+    [102.88149808513786, 0.3175050438379287],
+    [102.88149808513786, 0.7294742651616473],
+    [102.48873685466911, 0.7294742651616473],
+    [102.48873685466911, 0.3175050438379287]
+  ]
+]);
+
+var classes = ee.FeatureCollection([
+  ee.Feature(burnPoly, {label: 'Burned'}),
+  ee.Feature(vegPoly, {label: 'Vegetation'})
+]);
+
+Map.addLayer(burnPoly, {color:'red'}, 'Burn');
+Map.addLayer(vegPoly, {color:'green'}, 'Vegetation');
+
+/*** 3) DATA (SENSOR) ***/
+var col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(riau)
+  .filterDate(START, END)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 80));
+
+/*** 4) MASKING  ***/
+function maskS2(img){
+  var scl = img.select('SCL');
+
+  var mask = scl.neq(9)   // cloud high
+    .and(scl.neq(10));    // cirrus
+
+  var scaled = img.select(['B8','B12']).multiply(0.0001);
+
+  return scaled.updateMask(mask)
+               .copyProperties(img, ['system:time_start']);
+}
+
+var masked = col.map(maskS2);
+
+/*** 5) LIST BULAN ***/
+var nMonths = ee.Date(END).difference(ee.Date(START), 'month');
+var months = ee.List.sequence(0, nMonths.subtract(1));
+
+/*** 6) KOMPOSIT BULANAN + NBR ***/
+var monthly = ee.ImageCollection(months.map(function(m){
+
+  var start = ee.Date(START).advance(m, 'month');
+  var end   = start.advance(1, 'month');
+
+  var subset = masked.filterDate(start, end);
+
+  // Median
+  var comp = subset.median();
+
+  var nbr = comp.normalizedDifference(['B8','B12'])
+    .rename('NBR');
+
+  return nbr
+    .clip(riau)
+    .set('system:time_start', start.millis())
+    .set('date', start.format('YYYY-MM'));
+}));
+
+/*** 7) TIME SERIES ***/
+var ts = ee.FeatureCollection(monthly.map(function(img){
+
+  var date = ee.Date(img.get('system:time_start')).format('YYYY-MM');
+
+  var stats = img.reduceRegions({
+    collection: classes,
+    reducer: ee.Reducer.mean(),
+    scale: SCALE
+  }).map(function(f){
+
+    var val = ee.Number(f.get('mean'));
+
+    // Jika null →  (interpolasi sederhana)
+    return f.set({
+      date: date,
+      mean: val
+    });
+  });
+
+  return stats;
+
+})).flatten();
+
+/*** 8) CHART  ***/
+var chart = ui.Chart.feature.groups({
+  features: ts,
+  xProperty: 'date',
+  yProperty: 'mean',
+  seriesProperty: 'label'
+})
+.setOptions({
+  title: 'NBR Time Series (Burned vs Vegetation)',
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'NBR'},
+  lineWidth: 2,
+  pointSize: 4,
+  interpolateNulls: true   
+});
+
+print(chart);
+
+/*** 9) VISUALISASI FULL AOI ***/
+var last = monthly.sort('system:time_start', false).first();
+
+Map.addLayer(last, {
+  min: -0.5,
+  max: 0.8,
+  palette: ['black','red','orange','yellow','green']
+}, 'NBR Last');
+
+/*** 10) EXPORT ***/
+Export.table.toDrive({
+  collection: ts,
+  description: 'TS_NBR_Riau_FINAL',
+  fileFormat: 'CSV'
+});
+
+/*** 11) METADATA ***/
+print('CONFIG', {
+  dataset: 'Sentinel-2 SR',
+  periode: START + ' - ' + END,
+  index: 'NBR = (B12 - B8) / (B12 + B8)',
+  composite: 'Monthly median',
+  masking: 'Remove cloud high & cirrus only (SCL 9 & 10)',
+  scale: SCALE + ' m'
+});
